@@ -40,7 +40,7 @@ Or add to a project:
 uv add chrome-agent
 ```
 
-Requires Google Chrome or Chromium installed on the system. Single runtime dependency (`websockets`). No Playwright, no browser downloads.
+Requires Google Chrome or Chromium installed on the system. Runtime dependencies are `websockets`, plus `cryptography` and `keyring` for encrypting saved sessions. No Playwright, no browser downloads.
 
 ## Quick Start
 
@@ -69,7 +69,88 @@ chrome-agent help myproject-01 Page.navigate
 
 # Stop the browser when done
 chrome-agent stop myproject-01
+
+# Or stop a whole related set at once (quote the pattern -- see Instance Patterns)
+chrome-agent stop 'myproject-*'
 ```
+
+## Instance Patterns
+
+Anywhere an instance name is accepted, a glob works instead -- `*`, `?`, `[abc]`, matched case-sensitively against the registered names.
+
+```bash
+chrome-agent stop 'myproject-*'      # stops every match, printing the names first
+chrome-agent status 'myproject-*'    # lists every match
+chrome-agent 'myproject-0[2]' Page.navigate '{"url": "https://example.com"}'
+```
+
+`stop` and `status` act on every match. The single-browser commands -- `attach`, `help` and one-shot CDP calls -- resolve a pattern that matches exactly one instance and otherwise error with the candidates listed, rather than picking one. A pattern matching nothing is an error, not a silent no-op.
+
+**Quote the pattern.** Your shell expands an unquoted glob before chrome-agent sees it, and zsh aborts the command outright when nothing in the working directory matches (`zsh: no matches found: myproject-*`).
+
+A literal name is never treated as a pattern, so `chrome-agent stop myproject-01` cannot sweep up `myproject-02`. Because `stop --target` closes one tab, combining it with a pattern that matches several instances is refused.
+
+## Tab Completion
+
+zsh only, for now. Two ways to install it; pick one.
+
+**Sourced from `.zshrc`** -- one line, works anywhere, costs one subprocess
+(~60 ms) at shell startup. It must come *after* `compinit`:
+
+```bash
+source <(chrome-agent completions zsh)
+```
+
+**Installed as a file** -- no startup cost, but the directory has to be on
+`$fpath` *before* `compinit` runs, which is the step that is easy to miss:
+
+```bash
+mkdir -p ~/.config/zsh/completions
+chrome-agent completions zsh > ~/.config/zsh/completions/_chrome-agent
+```
+
+```bash
+fpath=(~/.config/zsh/completions $fpath)
+autoload -Uz compinit && compinit
+```
+
+That second block goes in `.zshrc`, in that order. If the directory is not on
+`$fpath`, the file is simply never read and Tab does nothing -- there is no
+error to tell you so.
+
+Either way, open a new shell and check it took:
+
+```bash
+chrome-agent <TAB>
+```
+
+You should get the subcommands and your running instances, each with a
+description. If nothing happens, `echo $_comps[chrome-agent]` should print
+`_chrome-agent`; an empty result means the completion was never registered.
+
+The generated file is a snapshot of the completion logic, so regenerate it after
+upgrading chrome-agent (the *candidates* it offers are always read live; the
+function itself is not). Sourcing from `.zshrc` avoids that entirely.
+
+Completes the subcommands, their flags, the **live instance names**, and **CDP
+method and event names**:
+
+```
+chrome-agent stop reader<TAB>              -> ensorcell-reader-01, described by port and tab count
+chrome-agent taleb-01 Page.nav<TAB>        -> Page.navigate
+chrome-agent attach taleb-01 +Page.load<TAB> -> +Page.loadEventFired
+```
+
+Instance names are read from the registry as you type, so they are what is
+actually registered rather than a list baked in at install time. Methods and
+events come from the running browser's own `/json/protocol` -- the protocol
+*this* Chrome implements, not a snapshot shipped with chrome-agent -- cached on
+disk under the browser version, so a Chrome upgrade invalidates it. Without a
+running browser you simply get no candidates.
+
+The protocol cache lives under `$XDG_CACHE_HOME/chrome-agent` (default
+`~/.cache/chrome-agent`), one file per browser version; deleting it is safe and
+costs one 7 ms refetch.
 
 ## Two Channels
 
@@ -111,27 +192,79 @@ An attach session **exits on its own once it has outlived its purpose** -- when 
 
 ```
 chrome-agent launch [--headless] [--fingerprint PATH] [--port PORT] [--no-window-border]
-chrome-agent status [<instance>]
-chrome-agent attach <instance> [+Event ...] [--target SPEC] [--url SUBSTRING]
-chrome-agent stop <instance> [--target SPEC] [--url SUBSTRING]
-chrome-agent help [<instance>] [Domain | Domain.method]
+chrome-agent status [<instance|glob>]
+chrome-agent attach <instance|glob> [+Event ...] [--target SPEC | --target-id ID | --target-index N | --url SUBSTRING]
+chrome-agent stop <instance|glob> [--target SPEC | --target-id ID | --target-index N | --url SUBSTRING]
+chrome-agent help [<instance|glob>] [Domain | Domain.method]
 chrome-agent cleanup
+chrome-agent save <instance|glob>... | --all [--stop] [--as NAME] [--overwrite | --keep-both]
+chrome-agent restore [<name[@stamp]>...] | --all [--here] [--any-port] [--desktop saved|terminal] [--no-reattach] [--replace-profile] [--start-display]
+chrome-agent snapshots [list [<glob>] | show <name[@stamp]> | rm <ref>... [--older-than AGE] [--yes] | export-key | import-key [--replace]]
+chrome-agent completions <zsh | instances | snapshots | methods | events> [<instance>]
 chrome-agent --version
 ```
 
 | Command | Description |
 |---------|-------------|
 | `launch` | Find Chrome, launch with CDP enabled. Auto-allocates a port and names the instance from the current directory. |
-| `status` | List running instances with their page targets (IDs, URLs, titles). |
-| `attach` | Persistent event observation with isolated subscriptions. Use `--target N` or `--url substring` for multi-tab browsers. |
-| `stop` | Gracefully shut down a browser instance (`Browser.close`) or close a specific tab (`Target.closeTarget`). Use `--target` or `--url` to close a single tab without affecting the browser. |
+| `status` | List running instances with their page targets (IDs, URLs, titles). Accepts a glob to list a matching subset. A browser you cannot see is tagged in the header -- `[Xvfb :95]` for one on a virtual X display (Xvfb, Xvnc, Xephyr), `[headless]` for one with no window -- and the JSON form carries a `display` field for every live instance (`{"kind": "desktop" \| "virtual" \| "headless", ...}`). |
+| `attach` | Persistent event observation with isolated subscriptions. Use `--target` (fewer than 8 digits is a tab index, anything else a target-id prefix), `--url substring`, or the explicit `--target-id` / `--target-index` for multi-tab browsers. |
+| `stop` | Gracefully shut down a browser instance (`Browser.close`) or close a specific tab (`Target.closeTarget`). Accepts a glob, stopping every matching instance. Use `--target` or `--url` to close a single tab without affecting the browser; because this closes a tab, prefer the explicit `--target-id` / `--target-index`. |
 | `help` | Query the browser's protocol schema. Lists domains, commands, events, parameters. |
 | `cleanup` | Remove stale instances (dead browsers) and their session directories. |
+| `save` | Snapshot running instances -- profile, tabs, cookies, launch flags, desktop, observers -- so they can be restored later. See [Saving and Restoring Sessions](#saving-and-restoring-sessions). |
+| `restore` | Bring snapshots back as running instances under their original names and ports. |
+| `snapshots` | List, inspect (`show`) and delete (`rm`) saved snapshots; back up the encryption key. |
+| `completions` | `zsh` prints a shell completion; `instances`, `methods` and `events` print `name:description` lines for the registered instances and for the running browser's CDP protocol (what the completion reads as you type). |
 | `--version` | Print the installed chrome-agent version (`-V` alias) and exit. |
 
 Instances are tracked in a registry at `/tmp/chrome-agent/registry.json`. A headed browser's instance is **automatically removed from the registry when its window is closed** (its session directory is cleaned up too), so `status` reflects what is actually running. Liveness is determined by **process identity plus port attribution**, not a bare PID-existence check: the recorded PID counts only if it is a live process of the launching user whose start time matches what was recorded at launch (so a recycled or namespace-local PID never masquerades as the browser), and a listening CDP port counts only if a process claiming that port with this instance's profile directory can be found -- so browsers started via wrapper/snap launchers (which fork the real browser into another process) are still reported correctly, while a port since claimed by a *different* browser is not mistaken for this one. A **transient connection drop does not retire a live instance**: a host suspend/resume severs the supervisor's CDP connection while Chrome keeps running, so the supervisor reconnects and keeps supervising; retirement happens only once the CDP port stops listening. `cleanup` removes any entries that remain (headless instances, or browsers that were killed abruptly).
 
 Two consequences worth knowing. **Launching from inside a PID-namespaced sandbox** (a container, bubblewrap, some agent-CLI sandboxes) records the sandbox's local PID in the shared registry; the identity check recognizes such an entry as stale once its browser is gone, instead of treating the aliased host PID as a live browser forever. **`stop` verifies its target before acting**: it never sends `Browser.close` to a port that is serving a different browser (it terminates the instance's own verified process instead, or just cleans up the stale entry), and its SIGTERM fallback only ever fires at a PID verified to be the instance's own browser process.
+
+## Saving and Restoring Sessions
+
+A launched browser's profile lives under `/tmp/chrome-agent/` and is deleted when the browser closes -- and most Linux systems empty `/tmp` at boot anyway. So logins, cookies and open tabs do not survive a restart unless you save them:
+
+```bash
+chrome-agent save --all --stop     # before a reboot: close every instance cleanly and save it
+chrome-agent restore --all         # after: bring them all back
+```
+
+A snapshot holds everything needed to bring an instance back as it was:
+
+- **The profile** -- cookies, localStorage, IndexedDB, saved logins -- minus caches and components Chrome re-downloads on its own (a real profile is typically 5-20 MB saved).
+- **Every cookie the browser holds in memory**, including session cookies that are never written to disk; they are set again on restore before any tab loads.
+- **Windows and tabs**, with each window's size, position and active tab.
+- **Name, port and working directory**, so an agent or script that addresses `mysite-01` (or its port) carries on unchanged. A fresh `launch` avoids the ports the last `save --all` will restore onto.
+- **Launch settings** -- headless, extra Chrome flags, fingerprint flags and TZ, window border, and a custom `--user-data-dir` if one was given.
+- **The virtual desktop** of each window (Linux/X11), or -- for a browser kept off-screen on a virtual X display (Xvfb, Xvnc, Xephyr) -- that display and the command that started its server.
+- **`attach` observers** subscribed to the instance. One that wrote to a file (including a shell loop that re-attaches) is restarted on restore; one whose output was piped to a reader that is gone is printed as the command to run.
+
+```bash
+chrome-agent save mysite-01                  # live: the browser keeps running
+chrome-agent save mysite-01 --stop           # close it cleanly first -- fully consistent
+chrome-agent save 'mysite-*'                 # every matching instance
+chrome-agent restore mysite-01               # the latest version
+chrome-agent restore mysite-01@20260927T153000Z
+chrome-agent restore                         # everything launched from the current directory
+chrome-agent snapshots                       # list: name@stamp, saved, tabs, size, port, origin dir
+chrome-agent snapshots show mysite-01        # tabs, observers, launch flags, desktop
+chrome-agent snapshots rm mysite-01          # every version (asks first; --yes when scripted)
+chrome-agent snapshots rm --older-than 30d
+```
+
+**Versions.** Each save is a timestamped version. When one already exists, an interactive `save` shows when it was saved and its tabs and asks whether to overwrite it; answering no keeps both. Non-interactively, both are kept unless `--overwrite` is given. Nothing is ever deleted automatically -- not by a restore, not by age -- so saving and discarding credentials stays a deliberate act.
+
+**Consistency.** `--stop` closes the browser cleanly before copying, so every database is complete on disk; use it before a reboot. A live save copies the files while Chrome runs without taking any lock (Chrome holds most of its SQLite databases exclusively, and a reader's lock on the rest could make Chrome's own writes fail), re-reading any file that changes mid-copy. Cookies are captured from the running browser either way, so they do not depend on what Chrome has flushed to disk.
+
+**Encryption.** Snapshots are credential bundles, so every snapshot file except a small plaintext summary (no URLs, no cookies) is encrypted with AES-256-GCM under a key kept in the OS keyring (GNOME Keyring / KWallet, macOS Keychain, Windows Credential Locker). The keyring unlocks at login, so restores need no prompt; a snapshot that ends up in a backup or a synced folder is unreadable without the key. **If the keyring is lost, the snapshots are unrecoverable** -- back the key up with `chrome-agent snapshots export-key`, and load it on another machine with `chrome-agent snapshots import-key < keyfile`. On a host with no keyring service, set `CHROME_AGENT_SNAPSHOT_KEY` to a base64 32-byte key. Snapshots live in `~/.local/share/chrome-agent/snapshots/` (mode 0700).
+
+**Restoring safely.** `restore` refuses when the instance is already running (it was restored already, or the original never closed), when the saved port is taken by something else (`--any-port` picks a new one), or when a custom profile directory already exists (`--replace-profile` moves it aside rather than deleting it). It warns when the installed Chrome is older than the one that saved the snapshot, since an older Chrome may refuse a newer profile. Sites that bind a login to a device or IP, or expire it server-side, may still ask you to sign in again.
+
+**Virtual displays.** A browser running on a virtual X display is restored onto that same display, never onto the screen of whoever runs `restore`. A virtual display usually does not survive a reboot, so `restore` refuses while it is down and names the command that starts it; `--start-display` runs that recorded command (e.g. `Xvfb :90 -screen 0 1920x1200x24 -nolisten tcp`) first. A browser on your own desktop is not tied to a display number -- that can change across a reboot -- and follows the display `restore` runs on.
+
+**Virtual desktops.** A single restore puts the browser on the current terminal's desktop, alongside the project you just reopened. `restore --all` puts each window back on the desktop it was saved from (`--desktop` overrides either default). With dynamic workspaces (GNOME's default) a window can only go as far as the last workspace that exists -- the window manager deletes empty workspaces in the middle -- so `restore --all` works through the snapshots in desktop order: the original layout comes back where the workspaces in between are occupied, and otherwise windows are packed down, keeping the ones that shared a desktop together and in order.
 
 ## Interacting with Elements
 
@@ -202,6 +335,16 @@ chrome-agent launch --fingerprint profile.json
 Spoofs the user agent (HTTP header and JavaScript), viewport, language, and timezone via Chrome launch flags -- persistent across navigations, with no JavaScript injection.
 
 It deliberately does **not** patch `navigator.webdriver`, `navigator.platform`, `navigator.vendor`, or `window.chrome`. An empirical detection audit found those JS overrides are each independently detectable and make the browser *more* detectable, not less: they flip bot.sannysoft.com's WebDriver test from pass to fail (the override makes `navigator.webdriver` an own property) and raise CreepJS's headless score. A plain CDP-attached Chrome already reports the native `navigator.webdriver === false` and keeps the genuine `window.chrome` shape, so the cleanest profile is one that leaves the JS environment untouched. A profile's `platform`/`vendor` should match the host OS (they are retained in the schema but not spoofed). Note that WebRTC can still leak the real IP regardless of profile.
+
+Headless mode has one giveaway that has nothing to do with fingerprinting: Chrome puts `HeadlessChrome/` in the User-Agent (`...HeadlessChrome/151.0.0.0 Safari/537.36`), and some sites block on that string alone. A profile's `userAgent` replaces it. For a lighter fix, derive the ordinary UA from a running headless instance and relaunch with only that flag:
+
+```bash
+UA=$(chrome-agent <instance> Browser.getVersion | sed -n '/"userAgent"/{s/.*"userAgent": "\([^"]*\)".*/\1/;s/HeadlessChrome/Chrome/;p;}')
+chrome-agent stop <instance>
+chrome-agent launch --headless -- "--user-agent=$UA"
+```
+
+Derived this way, the version and platform always match the installed Chrome; a hardcoded UA drifts out of step on the next update, and a UA claiming a different version than the browser is its own signal.
 
 ## For AI Agents
 

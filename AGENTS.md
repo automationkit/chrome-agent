@@ -2,7 +2,7 @@
 
 Drive a real Chrome through the Chrome DevTools Protocol (CDP), from the terminal, for AI agents.
 
-Install: `uv tool install chrome-agent` (or `pip install chrome-agent`). Requires Google Chrome or Chromium. One runtime dependency (`websockets`); no Playwright, no browser downloads.
+Install: `uv tool install chrome-agent` (or `pip install chrome-agent`). Requires Google Chrome or Chromium. Runtime dependencies: `websockets`, plus `cryptography` and `keyring` for encrypted session snapshots; no Playwright, no browser downloads.
 
 ## What it is
 
@@ -184,17 +184,18 @@ Output is JSON on stdout. A one-shot prints the CDP method's **raw result object
 
 ```bash
 chrome-agent launch [--port PORT] [--headless] [--fingerprint profile.json] [--no-window-border]
-chrome-agent status [<instance>]
-chrome-agent attach <instance> [+Event ...] [--target SPEC] [--url SUBSTRING]
-chrome-agent stop <instance> [--target SPEC] [--url SUBSTRING]
-chrome-agent help [<instance>] [Domain | Domain.method]
+chrome-agent status [<instance|glob>]
+chrome-agent attach <instance|glob> [+Event ...] [--target SPEC | --target-id ID | --target-index N | --url SUBSTRING]
+chrome-agent stop <instance|glob> [--target SPEC | --target-id ID | --target-index N | --url SUBSTRING]
+chrome-agent help [<instance|glob>] [Domain | Domain.method]
 chrome-agent cleanup
+chrome-agent completions <zsh | instances | methods | events> [<instance>]
 chrome-agent --version
-chrome-agent <instance> Domain.method '{"param": "value"}'
+chrome-agent <instance|glob> Domain.method '{"param": "value"}'
 ```
 
 - `launch` → `{"name","port","pid","browser_version"}`
-- `status` → `[{"name","port","alive","targets":[{"id","full_id","index","url","title"}]}]` — `index` is what `--target N` selects
+- `status` → `[{"name","port","alive","targets":[{"id","full_id","index","url","title"}]}]` — `index` is what `--target N` selects; `id` (the 8-char short form) and `full_id` both work as `--target`/`--target-id` specs
 - `Page.navigate` → `{"frameId","loaderId","isDownload"}`
 - `Runtime.evaluate` (`returnByValue:true`) → `{"result":{"type":"string","value":"..."}}` — read **`result.value`** (the value sits under the `result` key)
 - `Page.captureScreenshot` → `{"data":"<base64 png>"}` — bytes are at `data`, **not** `result.data`; decode with `… | python3 -c "import sys,json,base64; open('/tmp/s.png','wb').write(base64.b64decode(json.load(sys.stdin)['data']))"` — then view `/tmp/s.png` to actually see the render.
@@ -205,25 +206,55 @@ chrome-agent <instance> Domain.method '{"param": "value"}'
 chrome-agent mysite-01 --target 2 Page.navigate '{"url":"..."}'   # 1-based index
 chrome-agent mysite-01 --target 956FD3C2 Runtime.evaluate '{...}' # target-id prefix
 chrome-agent mysite-01 --url example.com Runtime.evaluate '{...}' # url substring
+chrome-agent mysite-01 --target-index 2 Runtime.evaluate '{...}'  # index, no inference
+chrome-agent mysite-01 --target-id 65602889 Runtime.evaluate '{...}' # id, no inference
 ```
 
 A one-shot against multiple tabs without a specifier is an error that lists them. **Index gotcha:** `--target N` indices are sorted by stable target id, **not** tab creation/visual order — opening a tab can renumber the others. Prefer `--url` or an id prefix for stability.
+
+**Bare `--target` reads its spec by length:** a run of fewer than 8 digits is a tab index; anything else is a target-id prefix, matched case-insensitively so a lower-cased id works. So the `id` field from `status` is usable directly — including the ~1-in-43 target id whose 8-char short form is all digits (ids are uppercase hex, so `(10/16)**8` of short ids contain no letter; those used to be read as an out-of-range index and rejected, in an error that listed the very tab it could not find).
+
+Length is the discriminator, **not** range: a mistyped `--target 5` against 3 tabs stays a plain out-of-range error rather than silently resolving to whichever tab's id happens to start with `5`. Each failure names the flag that forces the other reading.
+
+**`--target-id`, `--target-index` and `--url` skip the inference entirely.** Worth it for `stop --target`, which closes a tab, and required for an **all-digit** id prefix shorter than 8 characters — a short prefix containing any letter (`--target 956F`) is unambiguous and needs no flag.
+
+## Selecting instances by pattern
+
+Anywhere an instance name is taken, a **glob** works instead — `*`, `?`, `[abc]`, matched case-sensitively against the registered names. What a multi-match means depends on the command:
+
+```bash
+chrome-agent stop 'mysite-*'              # stops EVERY match, after printing which
+chrome-agent status 'mysite-*'            # lists every match
+chrome-agent 'mysite-0[2]' Page.navigate '{"url":"..."}'   # one match: acts on it
+chrome-agent 'mysite-*' Page.navigate '{"url":"..."}'      # several: error listing them
+```
+
+`stop` and `status` **fan out** over every match — `stop` prints `Pattern 'mysite-*' matched N instances:` and the names before it starts, so a broad pattern leaves a record of what it swept up, and exits non-zero if any stop failed. The single-browser commands (`attach`, `help`, one-shots) resolve a **one-match** pattern transparently and otherwise error with the candidate list, the same shape as the ambiguous-*tab* error. A pattern matching nothing is an error, not a silent no-op.
+
+**Quote the pattern.** The shell expands an unquoted glob first, and zsh *aborts the command* when nothing in the working directory matches it (`zsh: no matches found: mysite-*`) — chrome-agent never runs. `chrome-agent stop mysite-*` is not the same command as `chrome-agent stop 'mysite-*'`.
+
+Two more edges: a **literal** name is never globbed, so `stop mysite-01` cannot sweep up `mysite-02`; and a **glob is always an instance argument**, never a method name (methods aren't globbable), so a wildcard first argument is never misread as `Domain.method`. `stop --target` closes one tab, which is meaningless across several browsers — combining it with a multi-match pattern is refused rather than applied to each.
 
 ## Managing instances
 
 ```bash
 chrome-agent launch                       # auto port + name (from cwd); isolated profile under /tmp/chrome-agent
-chrome-agent launch --headless            # no window (no border, no desktop pinning)
+chrome-agent launch --headless            # no window (no border, no desktop pinning); UA says "HeadlessChrome" -- see Gotchas
 chrome-agent launch --fingerprint p.json  # spoof UA/viewport/lang/TZ via launch flags (also suppresses the marker)
 chrome-agent launch -- --some-chrome-flag # everything after -- passes through to Chrome
-chrome-agent status                       # all instances + their tabs
-chrome-agent stop mysite-01 [--target 2 | --url foo]   # whole browser, or one tab
+chrome-agent status                       # all instances + their tabs; [Xvfb :95] / [headless] mark off-screen ones
+chrome-agent stop mysite-01 [--target-index 2 | --target-id 65602889 | --url foo]  # whole browser, or one tab
+chrome-agent stop 'mysite-*'              # every instance matching the glob (quote it)
 chrome-agent cleanup                      # drop dead instances + stale session dirs
 ```
 
-**Instances outlive your task — stopping them is part of the workflow, not optional cleanup.** A launched instance is a full Chrome process that keeps running (and accumulating memory) until stopped. When you're done with an instance you launched: `chrome-agent stop <instance>`, then **verify with `chrome-agent status`** that the instances you started are gone — the stop's return is not the verification; the status read is. If dead instances or stale session dirs linger, `chrome-agent cleanup`. Keep an instance alive only deliberately (e.g. its login session is wanted for later work) — never by omission.
+**Instances outlive your task — stopping them is part of the workflow, not optional cleanup.** A launched instance is a full Chrome process that keeps running (and accumulating memory) until stopped. When you're done with the instances you launched: `chrome-agent stop <instance>` (or `chrome-agent stop '<glob>'` to take a whole related set down at once), then **verify with `chrome-agent status`** that the instances you started are gone — the stop's return is not the verification; the status read is. If dead instances or stale session dirs linger, `chrome-agent cleanup`. Keep an instance alive only deliberately (e.g. its login session is wanted for later work) — never by omission.
 
 Headed launches are marked (colored border + `🤖 <instance>` title prefix) so a human can tell an agent-driven window from their own; `--no-window-border` disables it. Closing a headed window **auto-retires** its instance from the registry in real time (a transient CDP drop does not); `status` is real-time truth (port-based liveness). On Linux/X11 the window is pinned to the launching terminal's desktop (needs `xdotool`).
+
+**Saving and restoring sessions.** An instance's profile is deleted when its browser closes, and `/tmp` is usually emptied at boot. `chrome-agent save <instance>` snapshots it -- profile (logins, cookies, storage), every in-memory cookie, windows and tabs, name, port, launch flags, desktop and `attach` observers -- encrypted under a key in the OS keyring; `--stop` closes the browser cleanly first (the consistent choice before a reboot); `save --all [--stop]` does every running instance. `chrome-agent restore <name>` (or `restore --all`, or bare `restore` for everything launched from the current directory) brings it back under the **same name and port**, so commands addressed to it keep working. `chrome-agent snapshots` lists them; `snapshots show <name>` lists the saved tabs and the attach commands to resume; `snapshots rm` deletes. **A snapshot is a bundle of the user's live credentials: save one only when asked to**, not as routine cleanup. `restore` refuses when the instance is already running, its port is taken by something else (`--any-port`), or it ran on a virtual X display (Xvfb) that is not up (`--start-display` starts it from the recorded command -- it is restored onto that display, never the user's screen); a restored `attach` observer that was piped (e.g. into your Monitor) is not restarted -- re-run the printed command.
+
+**Tab completion.** `chrome-agent completions zsh` prints a zsh completion for the subcommands, their flags, and the **live instance names** — it calls `chrome-agent completions instances` as you type, so the names offered are the ones actually registered. Install it either by sourcing (`source <(chrome-agent completions zsh)` in `.zshrc`, after `compinit`) or as a file named `_chrome-agent` in a directory that is on `$fpath` **before** `compinit` runs — a file in a directory that is not on `$fpath` is silently never read. zsh only, for now. `completions instances`, `methods` and `events` print `name:description` lines and are useful on their own as cheap machine-readable lists. Methods and events are read from the **running browser's** own `/json/protocol`, so they describe the protocol *this* Chrome implements -- including surface newer than any list bundled with chrome-agent -- and are cached on disk under the browser version, since zsh runs completion on every keystroke when autosuggestions use the completion strategy.
 
 **Fingerprint** spoofs user agent, viewport, language, and timezone via Chrome launch flags (no JS injection). It deliberately does **not** patch `navigator.webdriver`/`window.chrome` — an empirical audit (bot.sannysoft.com / CreepJS) found those overrides make Chrome *more* detectable, not less. WebRTC can still leak the real public IP via STUN regardless. Schema + audit: see the README.
 
@@ -234,6 +265,21 @@ Headed launches are marked (colored border + `🤖 <instance>` title prefix) so 
 - **Event isolation.** Each `attach` session sees only its own subscriptions.
 - **Multiple live instances** disable name auto-selection for **bare one-shot methods** — they error, asking you to specify one. `help` is the exception: it auto-picks any live instance (the protocol schema is identical across them), so it never needs naming.
 - **Launching from inside a PID-namespaced sandbox** (a container, bubblewrap, some agent-CLI sandboxes) records the sandbox-local PID in the shared registry. Liveness copes — the identity check disowns the aliased host PID and falls back to attributing the CDP port — but the instance is only reachable from outside while the sandbox shares the host network, and it dies with the sandbox. Prefer launching on the host; always pick a fresh port (never reuse another instance's — two browsers given the same `--remote-debugging-port` leave the loser running CDP-less).
+- **A site that fails headless but works headed may just be sniffing the User-Agent.** Headless Chrome puts `HeadlessChrome/` in both the `User-Agent` header and `navigator.userAgent`, and some sites return 403 on that string alone. Don't switch to headed -- take the instance's own UA, change that one word, and relaunch headless with it:
+  ```bash
+  UA=$(chrome-agent <instance> Browser.getVersion | sed -n '/"userAgent"/{s/.*"userAgent": "\([^"]*\)".*/\1/;s/HeadlessChrome/Chrome/;p;}')
+  chrome-agent stop <instance>
+  chrome-agent launch --headless -- "--user-agent=$UA"
+  ```
+  (With `jq`: `jq -r '.userAgent | sub("HeadlessChrome/"; "Chrome/")'`.) On Chrome 151 / Linux, for example, the UA goes from
+  ```
+  Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/151.0.0.0 Safari/537.36
+  ```
+  to
+  ```
+  Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36
+  ```
+  Your version and platform token will differ (`Macintosh; Intel Mac OS X 10_15_7`, `Windows NT 10.0; Win64; x64`), which is why the string is derived from the running browser rather than copied. Verify with `chrome-agent <instance> Runtime.evaluate '{"expression":"navigator.userAgent","returnByValue":true}'`. A `--fingerprint` profile's `userAgent` sets the UA the same way.
 
 ## Further reading
 

@@ -9,6 +9,7 @@ All public functions accept an optional registry_path parameter for test
 isolation.
 """
 
+import fnmatch
 import json
 import logging
 import os
@@ -24,6 +25,11 @@ from .utils import process_is_ours
 logger = logging.getLogger(__name__)
 
 REGISTRY_PATH = "/tmp/chrome-agent/registry.json"
+
+# Characters that make an instance argument a glob pattern rather than a
+# literal name. Instance names are derived from directory basenames, which
+# never contain these, so the distinction is unambiguous.
+GLOB_CHARS = "*?["
 BASE_PORT = 9222
 MAX_PORT = BASE_PORT + 100
 
@@ -55,6 +61,103 @@ class InstanceNotFoundError(Exception):
                 f"Instance '{name}' not found. No instances registered. "
                 f"Launch one with: chrome-agent launch"
             )
+
+
+class NoMatchingInstancesError(InstanceNotFoundError):
+    """A glob pattern matched no registered instance.
+
+    Subclasses InstanceNotFoundError so existing handlers keep working; only
+    the message differs, naming the argument as a pattern rather than a name.
+    """
+    def __init__(self, pattern: str, available: list[str]):
+        Exception.__init__(self)
+        self.name = pattern
+        self.available = available
+        if available:
+            avail_str = ", ".join(available)
+            self.args = (
+                f"Pattern '{pattern}' matched no instances. Available: {avail_str}",
+            )
+        else:
+            self.args = (
+                f"Pattern '{pattern}' matched no instances. No instances "
+                f"registered. Launch one with: chrome-agent launch",
+            )
+
+
+class AmbiguousInstanceError(Exception):
+    """A glob pattern matched several instances where one was required."""
+    def __init__(self, pattern: str, matches: list[str]):
+        self.pattern = pattern
+        self.matches = matches
+        match_str = ", ".join(matches)
+        super().__init__(
+            f"Pattern '{pattern}' matches {len(matches)} instances: {match_str}. "
+            f"Narrow the pattern, or name one instance."
+        )
+
+
+def is_pattern(name: str) -> bool:
+    """Whether an instance argument should be read as a glob rather than a name."""
+    return any(char in name for char in GLOB_CHARS)
+
+
+def resolve_instance_names(
+    name_or_pattern: str,
+    registry_path: str | None = None,
+) -> list[str]:
+    """Resolve an instance argument to the registered names it designates.
+
+    A literal name resolves to itself (raising InstanceNotFoundError when it is
+    not registered, exactly as lookup does). A glob pattern -- any argument
+    containing *, ? or [ -- is matched case-sensitively against every
+    registered name with fnmatch, and every match is returned, sorted.
+
+    Note for interactive use: a shell expands an unquoted glob before
+    chrome-agent ever sees it (zsh aborts the command outright when nothing in
+    the working directory matches), so patterns must be quoted.
+    """
+    path = _resolve_path(registry_path)
+    registry = _load_registry(path)
+
+    if not is_pattern(name_or_pattern):
+        if name_or_pattern not in registry:
+            raise InstanceNotFoundError(
+                name=name_or_pattern,
+                available=list(registry.keys()),
+            )
+        return [name_or_pattern]
+
+    matches = sorted(
+        name for name in registry
+        if fnmatch.fnmatchcase(name, name_or_pattern)
+    )
+    if not matches:
+        raise NoMatchingInstancesError(
+            pattern=name_or_pattern,
+            available=list(registry.keys()),
+        )
+    return matches
+
+
+def resolve_instance_name(
+    name_or_pattern: str,
+    registry_path: str | None = None,
+) -> str:
+    """Resolve an instance argument that must designate exactly one instance.
+
+    Used by the commands that act on a single browser (attach, one-shot CDP,
+    help). Raises AmbiguousInstanceError, listing the candidates, when a
+    pattern matches more than one -- the same shape as the ambiguous-target
+    error a bare one-shot gives across multiple instances.
+    """
+    matches = resolve_instance_names(
+        name_or_pattern=name_or_pattern,
+        registry_path=registry_path,
+    )
+    if len(matches) > 1:
+        raise AmbiguousInstanceError(pattern=name_or_pattern, matches=matches)
+    return matches[0]
 
 
 def _resolve_path(registry_path: str | None) -> str:
@@ -209,13 +312,14 @@ def _derive_unique_name(base_name: str, registry: dict) -> str:
         suffix += 1
 
 
-def allocate_port(registry: dict) -> int:
+def allocate_port(registry: dict, reserved: set[int] | None = None) -> int:
     """Find the next available port starting from BASE_PORT.
 
-    Skips ports used by live registry entries and ports with active
-    listeners. Raises RuntimeError if no ports available in range.
+    Skips ports used by live registry entries, ports with active listeners,
+    and ``reserved`` ports (those a saved session will be restored onto).
+    Raises RuntimeError if no ports available in range.
     """
-    used_ports = set()
+    used_ports = set(reserved or ())
     for entry in registry.values():
         # Identity check, not bare existence: a ghost entry whose namespace-local
         # PID aliases to a foreign host process must not reserve a port forever.
@@ -241,11 +345,16 @@ def register(
     port_override: int | None = None,
     registry_path: str | None = None,
     pid_start: str | None = None,
+    name_override: str | None = None,
+    launch: dict | None = None,
 ) -> InstanceInfo:
     """Register a new browser instance in the registry.
 
-    Derives the instance name from working_dir basename.
-    Auto-allocates a port unless port_override is specified.
+    Derives the instance name from working_dir basename, unless
+    ``name_override`` gives it (a restored session keeps its original name).
+    Auto-allocates a port unless port_override is specified. ``launch``
+    records how the browser was started, so a saved session can be relaunched
+    the same way.
     """
     path = _resolve_path(registry_path)
     registry = _load_registry(path)
@@ -255,8 +364,11 @@ def register(
     else:
         port = allocate_port(registry)
 
-    base_name = _derive_base_name(working_dir)
-    instance_name = _derive_unique_name(base_name, registry)
+    if name_override is not None:
+        instance_name = name_override
+    else:
+        base_name = _derive_base_name(working_dir)
+        instance_name = _derive_unique_name(base_name, registry)
 
     registry[instance_name] = {
         "port": port,
@@ -265,7 +377,10 @@ def register(
         "user_data_dir": user_data_dir,
         "launched": datetime.now(timezone.utc).isoformat(),
         "pid_start": pid_start,
+        "working_dir": working_dir,
     }
+    if launch is not None:
+        registry[instance_name]["launch"] = launch
     _save_registry(registry, path)
 
     logger.info("Registered instance %s on port %d (pid %d)", instance_name, port, pid)
